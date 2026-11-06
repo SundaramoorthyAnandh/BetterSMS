@@ -8,6 +8,8 @@
     <uses-permission android:name="android.permission.SEND_SMS" />
     <uses-permission android:name="android.permission.RECEIVE_MMS" />
     <uses-permission android:name="android.permission.RECEIVE_WAP_PUSH" />
+    <!-- List SIM cards so you can choose which one sends (dual-SIM phones) -->
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
     <!-- Show contact names instead of numbers -->
     <uses-permission android:name="android.permission.READ_CONTACTS" />
     <!-- Notifications + fingerprint -->

@@ -23,7 +23,7 @@ object IncomingSmsHandler {
             null
         } ?: return
         val c = context.container()
-        val subId = intent.getIntExtra("subscription", intent.getIntExtra("android.telephony.extra.SUBSCRIPTION_INDEX", -1))
+        val subId = Sims.subIdFromIntent(intent)
 
         parts.filterNotNull()
             .groupBy { it.displayOriginatingAddress ?: it.originatingAddress ?: "" }
@@ -48,7 +48,7 @@ object IncomingSmsHandler {
                 if (otp != null && settings.otpAutoCopy && cls.category != Category.SPAM && !cls.threat.isThreat) {
                     ClipboardGuard.copySensitive(context, otp.code, settings.clipboardClearSec)
                 }
-                Notifier.notifyIncoming(context, address, body, name, cls, settings)
+                Notifier.notifyIncoming(context, address, body, name, cls, settings, subId)
             }
         c.repo.requestRefresh()
         c.repo.cleanupOldOtps()

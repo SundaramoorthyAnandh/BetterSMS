@@ -4,6 +4,23 @@ import com.bettersms.app.classify.Category
 import com.bettersms.app.classify.Classification
 import com.bettersms.app.classify.SenderInfo
 
+/** Thread id meaning "not known yet"; threads that exist only locally use ids <= -10. */
+const val NO_THREAD = -1L
+
+/**
+ * A message the user sent from BetterSMS. Kept (encrypted) until the system SMS store has a
+ * matching row, so sent messages never disappear on phones that don't save them.
+ */
+data class OutgoingRecord(
+    val id: Long,
+    val address: String,
+    val body: String,
+    val date: Long,
+    val subId: Int,
+    /** SmsType.OUTBOX while sending, then SENT or FAILED. */
+    val status: Int,
+)
+
 object SmsType {
     const val INBOX = 1
     const val SENT = 2
@@ -21,11 +38,15 @@ data class SmsMessage(
     val date: Long,
     val type: Int,
     val read: Boolean,
+    /** SIM subscription the message used, or -1 if unknown. */
+    val subId: Int,
     val senderKey: String,
     val category: Category,
     val classification: Classification,
 ) {
     val isIncoming: Boolean get() = type == SmsType.INBOX
+    /** Only exists in BetterSMS's own sent log, not (yet) in the system SMS store. */
+    val isLocal: Boolean get() = id < 0
     val otp get() = classification.otp
     val threat get() = classification.threat
     val transaction get() = classification.transaction
@@ -48,6 +69,8 @@ data class Conversation(
     val unreadByCategory: Map<Category, Int>,
     val threatCount: Int,
     val blocked: Boolean,
+    /** SIM the newest incoming message arrived on, or -1. */
+    val lastIncomingSubId: Int = -1,
 )
 
 data class InboxState(
@@ -64,7 +87,7 @@ data class InboxState(
 ) {
     fun findConversation(threadId: Long, address: String?, key: String?): Conversation? {
         val all = conversations + blockedConversations
-        if (threadId >= 0) all.firstOrNull { it.threadId == threadId }?.let { return it }
+        if (threadId != NO_THREAD) all.firstOrNull { it.threadId == threadId }?.let { return it }
         if (key != null) all.firstOrNull { it.sender.key == key }?.let { return it }
         if (address != null) all.firstOrNull { it.address == address }?.let { return it }
         return null

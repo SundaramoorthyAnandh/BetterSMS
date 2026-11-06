@@ -19,8 +19,10 @@ class HeadlessSmsSendService : Service() {
             val recipients = intent.data?.let(::recipientsOf).orEmpty()
             if (!text.isNullOrBlank() && recipients.isNotEmpty()) {
                 val app = applicationContext
-                app.container().appScope.launch(Dispatchers.IO) {
-                    recipients.forEach { SmsSender.send(app, it, text) }
+                val c = app.container()
+                val sim = Sims.resolveForReply(app, c.store.settings.sendSim, Sims.subIdFromIntent(intent))
+                c.appScope.launch(Dispatchers.IO) {
+                    recipients.forEach { c.repo.send(it, text, sim) }
                     stopSelf(startId)
                 }
                 return START_NOT_STICKY

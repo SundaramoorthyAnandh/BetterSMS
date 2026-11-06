@@ -8,7 +8,7 @@ import android.widget.Toast
 import androidx.core.app.RemoteInput
 import com.bettersms.app.container
 import com.bettersms.app.security.ClipboardGuard
-import com.bettersms.app.sms.SmsSender
+import com.bettersms.app.sms.Sims
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
@@ -38,7 +38,9 @@ class NotificationActionReceiver : BroadcastReceiver() {
                     val pending = goAsync()
                     c.appScope.launch(Dispatchers.IO) {
                         try {
-                            SmsSender.send(app, address, text)
+                            val received = intent.getIntExtra(EXTRA_SUB_ID, -1)
+                            val sim = Sims.resolveForReply(app, c.store.settings.sendSim, received)
+                            c.repo.send(address, text, sim)
                             c.repo.markReadByAddress(address)
                         } finally {
                             pending.finish()
@@ -56,6 +58,7 @@ class NotificationActionReceiver : BroadcastReceiver() {
         const val EXTRA_ADDRESS = "address"
         const val EXTRA_CODE = "code"
         const val EXTRA_NOTIF_ID = "notif_id"
+        const val EXTRA_SUB_ID = "sub_id"
         const val KEY_REPLY = "reply_text"
     }
 }

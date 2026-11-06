@@ -7,6 +7,7 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Log
 import com.bettersms.app.classify.Category
+import com.bettersms.app.sms.SimChoice
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -38,6 +39,8 @@ data class AppSettings(
     val notifySpam: Boolean = false,
     /** 0 = system, 1 = light, 2 = dark. */
     val themeMode: Int = 0,
+    /** SimChoice.ASK, SimChoice.PHONE_DEFAULT, or a subscription id. */
+    val sendSim: Int = SimChoice.ASK,
 )
 
 data class StoreData(
@@ -48,6 +51,8 @@ data class StoreData(
     val overrides: Map<String, Category> = emptyMap(),
     /** "t:<threadId>" or sender key -> epoch ms when last read inside BetterSMS. */
     val readMarks: Map<String, Long> = emptyMap(),
+    /** Sent messages not yet confirmed in the system SMS store, newest last. */
+    val outgoing: List<OutgoingRecord> = emptyList(),
 )
 
 /**
@@ -127,10 +132,23 @@ class SecureStore(context: Context) {
             put("linkWarnings", s.linkWarnings)
             put("notifySpam", s.notifySpam)
             put("themeMode", s.themeMode)
+            put("sendSim", s.sendSim)
         })
         put("blocked", JSONArray(d.blocked.toList()))
         put("overrides", JSONObject().apply { d.overrides.forEach { (k, v) -> put(k, v.name) } })
         put("readMarks", JSONObject().apply { d.readMarks.forEach { (k, v) -> put(k, v) } })
+        put("outgoing", JSONArray().apply {
+            d.outgoing.forEach { r ->
+                put(JSONObject().apply {
+                    put("id", r.id)
+                    put("address", r.address)
+                    put("body", r.body)
+                    put("date", r.date)
+                    put("subId", r.subId)
+                    put("status", r.status)
+                })
+            }
+        })
     }
 
     private fun fromJson(o: JSONObject): StoreData {
@@ -149,6 +167,7 @@ class SecureStore(context: Context) {
             linkWarnings = s.optBoolean("linkWarnings", d.linkWarnings),
             notifySpam = s.optBoolean("notifySpam", d.notifySpam),
             themeMode = s.optInt("themeMode", d.themeMode),
+            sendSim = s.optInt("sendSim", d.sendSim),
         )
         val blocked = buildSet {
             val arr = o.optJSONArray("blocked") ?: JSONArray()
@@ -164,7 +183,23 @@ class SecureStore(context: Context) {
             val obj = o.optJSONObject("readMarks") ?: JSONObject()
             obj.keys().forEach { k -> put(k, obj.optLong(k)) }
         }
-        return StoreData(settings, blocked, overrides, readMarks)
+        val outgoing = buildList {
+            val arr = o.optJSONArray("outgoing") ?: JSONArray()
+            for (i in 0 until arr.length()) {
+                val r = arr.optJSONObject(i) ?: continue
+                add(
+                    OutgoingRecord(
+                        id = r.optLong("id"),
+                        address = r.optString("address"),
+                        body = r.optString("body"),
+                        date = r.optLong("date"),
+                        subId = r.optInt("subId", -1),
+                        status = r.optInt("status", SmsType.SENT),
+                    ),
+                )
+            }
+        }
+        return StoreData(settings, blocked, overrides, readMarks, outgoing)
     }
 
     private companion object {

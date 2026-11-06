@@ -47,6 +47,9 @@ import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.Key
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.Warning
+import androidx.compose.material.icons.rounded.ArrowDropDown
+import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.SimCard
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
@@ -99,6 +102,9 @@ import com.bettersms.app.ui.common.formatTime
 import com.bettersms.app.ui.common.hasPermission
 import com.bettersms.app.ui.common.openUrl
 import com.bettersms.app.ui.common.rememberIsDefaultSmsApp
+import com.bettersms.app.ui.common.rememberPermissionState
+import com.bettersms.app.sms.SimInfo
+import com.bettersms.app.sms.Sims
 import com.bettersms.app.ui.common.rememberRequestDefaultSms
 import com.bettersms.app.ui.glass.GlassCard
 import com.bettersms.app.ui.glass.GlassIconButton
@@ -143,7 +149,11 @@ fun ConversationScreen(
     val requestDefault = rememberRequestDefaultSms { repo.start() }
 
     val addressKey = remember(address) { address?.let { SenderAnalyzer.keyOf(it) } }
-    val conv = remember(state, threadId, address) { state.findConversation(threadId, address, addressKey) }
+    // Remember who we're talking to, so the chat survives its thread id changing (e.g. a message
+    // that only existed in BetterSMS's sent log gets saved by the system).
+    var knownKey by rememberSaveable { mutableStateOf(addressKey) }
+    val conv = remember(state, threadId, address, knownKey) { state.findConversation(threadId, address, knownKey) }
+    LaunchedEffect(conv?.sender?.key) { conv?.sender?.key?.let { knownKey = it } }
     val messages = remember(state, conv) { conv?.let { state.threads[it.threadId] }.orEmpty() }
     val targetAddress = conv?.address ?: address.orEmpty()
     val sender = remember(targetAddress) { SenderAnalyzer.analyze(targetAddress) }
@@ -158,8 +168,50 @@ fun ConversationScreen(
     var confirmDelete by remember { mutableStateOf(false) }
     var messageMenu by remember { mutableStateOf<SmsMessage?>(null) }
 
-    val sendPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (!granted) Toast.makeText(ctx, "SMS permission is needed to send", Toast.LENGTH_SHORT).show()
+    // SIM selection (dual-SIM phones)
+    val phoneGranted = rememberPermissionState(Manifest.permission.READ_PHONE_STATE)
+    val sims = remember(phoneGranted) { Sims.active(ctx) }
+    val multiSim = sims.size >= 2
+    var chatSim by rememberSaveable { mutableStateOf<Int?>(null) }
+    var askedPhonePermission by rememberSaveable { mutableStateOf(false) }
+    var simRequest by remember { mutableStateOf<SimRequest?>(null) }
+    val simSetting = settings.settings.sendSim
+
+    val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+        if (result[Manifest.permission.SEND_SMS] == false) {
+            Toast.makeText(ctx, "SMS permission is needed to send", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun execute(request: SimRequest, subId: Int) {
+        when (request) {
+            is SimRequest.Send -> {
+                text = ""
+                scope.launch {
+                    if (!repo.send(targetAddress, request.body, subId)) {
+                        Toast.makeText(ctx, "Couldn't send. Tap the message to retry.", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+            is SimRequest.Retry -> scope.launch { repo.retry(request.message, subId) }
+            SimRequest.ChooseForChat -> chatSim = subId
+        }
+    }
+
+    fun requestSend(request: SimRequest) {
+        val missing = buildList {
+            if (!ctx.hasPermission(Manifest.permission.SEND_SMS)) add(Manifest.permission.SEND_SMS)
+            if (Sims.isMultiSimCapable(ctx) && !Sims.hasPhonePermission(ctx) && !askedPhonePermission) {
+                add(Manifest.permission.READ_PHONE_STATE)
+            }
+        }
+        if (missing.isNotEmpty()) {
+            askedPhonePermission = true
+            permissionLauncher.launch(missing.toTypedArray())
+            return
+        }
+        val sub = chatSim?.takeIf { id -> sims.any { it.subId == id } } ?: Sims.resolveWithoutAsking(simSetting, sims)
+        if (sub == null) simRequest = request else execute(request, sub)
     }
 
     LaunchedEffect(conv?.threadId, messages.size) {
@@ -266,7 +318,7 @@ fun ConversationScreen(
                             leadingIcon = { Icon(Icons.Rounded.Delete, null, tint = c.danger) },
                             onClick = {
                                 menuOpen = false
-                                if (isDefault) confirmDelete = true else requestDefault()
+                                if (isDefault || conv.threadId < 0) confirmDelete = true else requestDefault()
                             },
                         )
                     }
@@ -306,7 +358,9 @@ fun ConversationScreen(
                     is ChatItem.Day -> DayHeader(item.day)
                     is ChatItem.Msg -> MessageBubble(
                         m = item.m,
+                        simLabel = if (multiSim) sims.firstOrNull { it.subId == item.m.subId }?.label else null,
                         onLink = onLink,
+                        onTap = { if (item.m.type == SmsType.FAILED) messageMenu = item.m },
                         onLongPress = { messageMenu = item.m },
                     )
                 }
@@ -314,6 +368,16 @@ fun ConversationScreen(
         }
 
         // Composer
+        if (sender.canReply && targetAddress.isNotBlank() && multiSim) {
+            val shown = chatSim?.takeIf { id -> sims.any { it.subId == id } } ?: Sims.resolveWithoutAsking(simSetting, sims)
+            val sim = sims.firstOrNull { it.subId == shown }
+            SimChip(
+                label = sim?.let { "Send with ${it.fullLabel}" } ?: "Ask for SIM on send",
+                color = sim?.color,
+                onClick = { simRequest = SimRequest.ChooseForChat },
+                modifier = Modifier.padding(start = 16.dp, top = 4.dp),
+            )
+        }
         if (sender.canReply && targetAddress.isNotBlank()) {
             Row(
                 Modifier
@@ -354,19 +418,7 @@ fun ConversationScreen(
                             else Brush.linearGradient(listOf(c.glassFillStrong, c.glassFillStrong)),
                         )
                         .clickable(enabled = canSend, role = Role.Button) {
-                            if (!ctx.hasPermission(Manifest.permission.SEND_SMS)) {
-                                sendPermission.launch(Manifest.permission.SEND_SMS)
-                                return@clickable
-                            }
-                            val body = text.trim()
-                            text = ""
-                            scope.launch {
-                                val ok = repo.send(targetAddress, body)
-                                if (!ok) {
-                                    text = body
-                                    Toast.makeText(ctx, "Couldn't send. Check SIM and signal.", Toast.LENGTH_SHORT).show()
-                                }
-                            }
+                            requestSend(SimRequest.Send(text.trim()))
                         },
                     contentAlignment = Alignment.Center,
                 ) {
@@ -412,7 +464,7 @@ fun ConversationScreen(
             destructive = true,
             onConfirm = {
                 scope.launch {
-                    if (repo.deleteThread(conv.threadId)) onBack()
+                    if (repo.deleteThread(conv.threadId, conv.sender.key)) onBack()
                     else Toast.makeText(ctx, "Couldn't delete. Make BetterSMS the default SMS app first.", Toast.LENGTH_LONG).show()
                 }
             },
@@ -423,7 +475,8 @@ fun ConversationScreen(
     messageMenu?.let { m ->
         MessageActionsDialog(
             m = m,
-            canDelete = isDefault,
+            canDelete = isDefault || m.isLocal,
+            onRetry = { requestSend(SimRequest.Retry(m)) },
             onDismiss = { messageMenu = null },
             onCopy = { ClipboardGuard.copyPlain(ctx, m.body, "Message") },
             onDelete = {
@@ -434,6 +487,117 @@ fun ConversationScreen(
             onRequestDefault = requestDefault,
         )
     }
+
+    simRequest?.let { request ->
+        SimPickerDialog(
+            sims = sims,
+            receivedOn = conv?.lastIncomingSubId ?: -1,
+            forChat = request == SimRequest.ChooseForChat,
+            onPick = { subId, always ->
+                simRequest = null
+                if (always) container.store.updateSettings { it.copy(sendSim = subId) }
+                execute(request, subId)
+            },
+            onDismiss = { simRequest = null },
+        )
+    }
+}
+
+private sealed interface SimRequest {
+    data class Send(val body: String) : SimRequest
+    data class Retry(val message: SmsMessage) : SimRequest
+    data object ChooseForChat : SimRequest
+}
+
+@Composable
+private fun SimChip(label: String, color: Int?, onClick: () -> Unit, modifier: Modifier = Modifier) {
+    val c = Glass.colors
+    Row(
+        modifier
+            .clip(CircleShape)
+            .glassSurface(strong = true, shape = CircleShape)
+            .clickable(role = Role.Button, onClickLabel = "Choose SIM", onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(Icons.Rounded.SimCard, null, tint = color?.let { Color(it) } ?: c.accent, modifier = Modifier.size(16.dp))
+        Spacer(Modifier.width(6.dp))
+        Text(label, color = c.textPrimary, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+        Spacer(Modifier.width(2.dp))
+        Icon(Icons.Rounded.ArrowDropDown, null, tint = c.textSecondary, modifier = Modifier.size(18.dp))
+    }
+}
+
+@Composable
+internal fun SimPickerDialog(
+    sims: List<SimInfo>,
+    receivedOn: Int,
+    forChat: Boolean,
+    onPick: (subId: Int, always: Boolean) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val c = Glass.colors
+    var always by remember { mutableStateOf(false) }
+    val defaultSub = remember { Sims.defaultSmsSubId() }
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = c.dialog,
+        shape = RoundedCornerShape(28.dp),
+        icon = { Icon(Icons.Rounded.SimCard, null, tint = c.accent) },
+        title = { Text(if (forChat) "SIM for this chat" else "Send with which SIM?", color = c.textPrimary) },
+        text = {
+            Column {
+                sims.forEach { sim ->
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp)
+                            .clip(RoundedCornerShape(18.dp))
+                            .glassSurface(strong = sim.subId == receivedOn, shape = RoundedCornerShape(18.dp))
+                            .clickable { onPick(sim.subId, always) }
+                            .padding(horizontal = 14.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Box(
+                            Modifier
+                                .size(36.dp)
+                                .background(Color(sim.color).copy(alpha = 0.18f), RoundedCornerShape(10.dp)),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Icon(Icons.Rounded.SimCard, null, tint = Color(sim.color), modifier = Modifier.size(20.dp))
+                        }
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(sim.label, color = c.textPrimary, fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+                            if (sim.carrier.isNotBlank()) Text(sim.carrier, color = c.textSecondary, fontSize = 13.sp)
+                        }
+                        when {
+                            sim.subId == receivedOn -> Pill("Received here", c.success)
+                            sim.subId == defaultSub -> Pill("Default", c.accent)
+                        }
+                    }
+                }
+                Spacer(Modifier.height(6.dp))
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable { always = !always }
+                        .padding(vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    androidx.compose.material3.Checkbox(
+                        checked = always,
+                        onCheckedChange = { always = it },
+                        colors = androidx.compose.material3.CheckboxDefaults.colors(checkedColor = c.accent),
+                    )
+                    Text("Always use this SIM", color = c.textPrimary, fontSize = 14.sp)
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = { androidx.compose.material3.TextButton(onClick = onDismiss) { Text("Cancel", color = c.accent) } },
+    )
 }
 
 @Composable
@@ -486,7 +650,7 @@ private fun DayHeader(day: LocalDate) {
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun MessageBubble(m: SmsMessage, onLink: (LinkInfo) -> Unit, onLongPress: () -> Unit) {
+private fun MessageBubble(m: SmsMessage, simLabel: String?, onLink: (LinkInfo) -> Unit, onTap: () -> Unit, onLongPress: () -> Unit) {
     val c = Glass.colors
     val ctx = LocalContext.current
     val incoming = m.isIncoming
@@ -535,7 +699,7 @@ private fun MessageBubble(m: SmsMessage, onLink: (LinkInfo) -> Unit, onLongPress
                         else Modifier.background(Brush.linearGradient(listOf(c.accent, c.accentEnd)), shape),
                     )
                     .then(if (danger) Modifier.border(1.5.dp, c.danger.copy(alpha = 0.7f), shape) else Modifier)
-                    .combinedClickable(onClick = {}, onLongClick = onLongPress)
+                    .combinedClickable(onClick = onTap, onLongClick = onLongPress)
                     .padding(horizontal = 14.dp, vertical = 10.dp),
             ) {
                 Text(annotated, color = textColor, fontSize = 15.sp, lineHeight = 21.sp)
@@ -584,9 +748,9 @@ private fun MessageBubble(m: SmsMessage, onLink: (LinkInfo) -> Unit, onLongPress
             }
             Spacer(Modifier.height(2.dp))
             Text(
-                formatTime(m.date) + when (m.type) {
+                formatTime(m.date) + (simLabel?.let { " · $it" } ?: "") + when (m.type) {
                     SmsType.OUTBOX, SmsType.QUEUED -> " · Sending…"
-                    SmsType.FAILED -> " · Failed"
+                    SmsType.FAILED -> " · Not sent · tap to retry"
                     else -> ""
                 },
                 color = if (m.type == SmsType.FAILED) c.danger else c.textTertiary,
@@ -601,6 +765,7 @@ private fun MessageBubble(m: SmsMessage, onLink: (LinkInfo) -> Unit, onLongPress
 private fun MessageActionsDialog(
     m: SmsMessage,
     canDelete: Boolean,
+    onRetry: () -> Unit,
     onDismiss: () -> Unit,
     onCopy: () -> Unit,
     onDelete: () -> Unit,
@@ -630,6 +795,12 @@ private fun MessageActionsDialog(
         title = { Text("Message", color = c.textPrimary) },
         text = {
             Column {
+                if (m.type == SmsType.FAILED) {
+                    ActionRow(Icons.Rounded.Refresh, "Retry sending", tint = c.accent) {
+                        onDismiss()
+                        onRetry()
+                    }
+                }
                 ActionRow(Icons.Rounded.ContentCopy, "Copy text") {
                     onCopy()
                     onDismiss()

@@ -13,9 +13,13 @@ leaves your phone.
 |---|---|---|---|
 | ![](docs/screenshots/05_settings.jpg) | ![](docs/screenshots/06_security_center.jpg) | ![](docs/screenshots/07_lock.jpg) | ![](docs/screenshots/08_onboarding.jpg) |
 
+| Dual-SIM chat | SIM picker |
+|---|---|
+| ![](docs/screenshots/09_dual_sim_chat.jpg) | ![](docs/screenshots/10_sim_picker_dialog.jpg) |
+
 ## Install
 
-1. Download `dist/BetterSMS-v1.0.0.apk` from this repo, or the `BetterSMS-apk` artifact of the latest
+1. Download `dist/BetterSMS-v1.1.0.apk` from this repo, or the `BetterSMS-apk` artifact of the latest
    **Build APK** GitHub Actions run.
 2. Open it on your phone and allow "Install unknown apps" for your browser or file manager when asked.
 3. Follow the 3 setup steps: allow SMS access, make BetterSMS your default SMS app (recommended), and
@@ -44,6 +48,19 @@ Transaction alerts show the amount as a debit or credit pill.
   them, and the clipboard is cleared after 30 s, 1 min or 2 min (you choose).
 - Optional auto-copy on arrival, which never runs for suspicious messages.
 - Optional auto-delete of old OTP messages after 1 h, 24 h or 7 days (needs default SMS app).
+
+### Sending & dual SIM
+- Every message you send appears in the chat right away as "Sending…", then shows as sent, or as
+  "Not sent · tap to retry". BetterSMS keeps its own encrypted record of sent messages, so they don't
+  disappear on phones (some Vivo, Xiaomi and Oppo builds) that never save SMS sent by an app that isn't
+  the default. When the system SMS store saves a copy, BetterSMS merges the two so you never see doubles.
+- On dual-SIM phones you choose how to send in **Settings › SIM for sending**: *Ask every time*
+  (default), *Phone's default SIM*, or always SIM 1 or always SIM 2.
+- When BetterSMS asks, the picker shows each SIM with its carrier and marks the one the conversation's
+  last message arrived on ("Received here"). Tick "Always use this SIM" to stop being asked.
+- A chip above the message box shows which SIM will send. Tap it to switch SIM for that chat.
+- Each message shows the SIM it used (e.g. `12:50 PM · SIM 2`).
+- Replies from a notification go out on the SIM the message arrived on, unless you picked a fixed SIM.
 
 ### Scam & phishing shield
 - Flags fake KYC/PAN/Aadhaar updates, "account will be blocked" threats, lottery/KBC, job and
@@ -90,6 +107,7 @@ different signatures: uninstall before installing a build from another machine.
 |---|---|
 | `READ_SMS`, `RECEIVE_SMS`, `SEND_SMS`, `RECEIVE_MMS`, `RECEIVE_WAP_PUSH` | Read, sort, receive and send messages (the last two are required for the default-SMS-app role) |
 | `READ_CONTACTS` | Show contact names instead of numbers |
+| `READ_PHONE_STATE` | List your SIM cards so you can choose which one sends |
 | `POST_NOTIFICATIONS` | New-message and OTP alerts |
 | `USE_BIOMETRIC` | Fingerprint lock |
 | `HIDE_OVERLAY_WINDOWS` | Hide other apps' overlays while BetterSMS is open |
@@ -100,7 +118,6 @@ different signatures: uninstall before installing a build from another machine.
   incoming MMS won't be shown. Keep another app as default if you rely on MMS.
 - Blocking, deleting and OTP auto-delete need BetterSMS to be the default SMS app (an Android rule).
   Without that, sorting, OTP help, scam warnings and notifications still work.
-- Sending uses the phone's default SIM for SMS.
 - Categorisation and scam detection use on-device rules tuned for Indian and English-language SMS.
   They are not a guarantee, so stay careful with any message asking for money or codes.
 

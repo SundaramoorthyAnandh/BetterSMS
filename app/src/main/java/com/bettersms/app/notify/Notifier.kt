@@ -92,6 +92,7 @@ object Notifier {
         displayName: String,
         cls: Classification,
         settings: AppSettings,
+        receivedSubId: Int = -1,
     ) {
         if (!canNotify(context)) return
         val sender = SenderAnalyzer.analyze(address)
@@ -157,7 +158,9 @@ object Notifier {
                     builder.addAction(
                         NotificationCompat.Action.Builder(
                             0, "Reply",
-                            actionIntent(context, NotificationActionReceiver.ACTION_REPLY, address, notifId, mutable = true),
+                            actionIntent(context, NotificationActionReceiver.ACTION_REPLY, address, notifId, mutable = true) {
+                                putExtra(NotificationActionReceiver.EXTRA_SUB_ID, receivedSubId)
+                            },
                         ).addRemoteInput(remoteInput).setAuthenticationRequired(true).setAllowGeneratedReplies(false).build(),
                     )
                 }

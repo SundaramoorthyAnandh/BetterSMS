@@ -46,20 +46,25 @@ object SmsProvider {
         }
     }
 
-    fun insertOutbox(context: Context, address: String, body: String): Uri? {
+    /** Records a message we are about to send (default SMS app only). */
+    fun insertOutgoing(context: Context, address: String, body: String, subId: Int, type: Int, date: Long): Uri? {
         val values = ContentValues().apply {
             put(Telephony.Sms.ADDRESS, address)
             put(Telephony.Sms.BODY, body)
-            put(Telephony.Sms.DATE, System.currentTimeMillis())
+            put(Telephony.Sms.DATE, date)
             put(Telephony.Sms.READ, 1)
             put(Telephony.Sms.SEEN, 1)
-            put(Telephony.Sms.TYPE, SmsType.OUTBOX)
+            put(Telephony.Sms.TYPE, type)
+            if (subId >= 0) put(Telephony.Sms.SUBSCRIPTION_ID, subId)
         }
+        val target = if (type == SmsType.SENT) Telephony.Sms.Sent.CONTENT_URI else Telephony.Sms.Outbox.CONTENT_URI
         return try {
-            context.contentResolver.insert(Telephony.Sms.Outbox.CONTENT_URI, values)
+            context.contentResolver.insert(target, values)
+                // Some OEM providers only accept inserts on the base URI.
+                ?: context.contentResolver.insert(Telephony.Sms.CONTENT_URI, values)
         } catch (e: Exception) {
-            Log.e(TAG, "insertOutbox failed", e)
-            null
+            Log.e(TAG, "insertOutgoing failed", e)
+            runCatching { context.contentResolver.insert(Telephony.Sms.CONTENT_URI, values) }.getOrNull()
         }
     }
 
@@ -68,6 +73,20 @@ object SmsProvider {
             context.contentResolver.update(uri, ContentValues().apply { put(Telephony.Sms.TYPE, type) }, null, null)
         } catch (e: Exception) {
             Log.e(TAG, "updateType failed", e)
+        }
+    }
+
+    /** Marks a multipart message sent, unless an earlier part already failed. */
+    fun markSentUnlessFailed(context: Context, uri: Uri) {
+        try {
+            context.contentResolver.update(
+                uri,
+                ContentValues().apply { put(Telephony.Sms.TYPE, SmsType.SENT) },
+                "${Telephony.Sms.TYPE}<>?",
+                arrayOf(SmsType.FAILED.toString()),
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "markSent failed", e)
         }
     }
 

@@ -36,6 +36,8 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.abs
 
 /**
  * Reads SMS from the system provider, classifies them on-device and exposes a ready-to-render
@@ -55,6 +57,7 @@ class SmsRepository(
         val date: Long,
         val type: Int,
         val read: Boolean,
+        val subId: Int = -1,
     )
 
     private val _state = MutableStateFlow(InboxState())
@@ -66,6 +69,7 @@ class SmsRepository(
     @Volatile private var raw: List<RawSms> = emptyList()
     @Volatile private var observerRegistered = false
     @Volatile private var lastOtpCleanup = 0L
+    private val localSeq = AtomicLong(0)
 
     private val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
         override fun onChange(selfChange: Boolean) = requestRefresh()
@@ -82,7 +86,7 @@ class SmsRepository(
         // Block list / overrides / settings changes only need a re-render, not a re-query.
         scope.launch(Dispatchers.IO) {
             store.data
-                .map { Triple(it.blocked, it.overrides, it.readMarks) to it.settings.scamProtection }
+                .map { listOf(it.blocked, it.overrides, it.readMarks, it.outgoing) to it.settings.scamProtection }
                 .distinctUntilChanged()
                 .drop(1)
                 .collect {
@@ -122,17 +126,18 @@ class SmsRepository(
             return@withContext
         }
         val list = ArrayList<RawSms>(1024)
+        val base = arrayOf(
+            Telephony.Sms._ID, Telephony.Sms.THREAD_ID, Telephony.Sms.ADDRESS, Telephony.Sms.BODY,
+            Telephony.Sms.DATE, Telephony.Sms.TYPE, Telephony.Sms.READ,
+        )
+        fun query(projection: Array<String>) = context.contentResolver.query(
+            Telephony.Sms.CONTENT_URI, projection, null, null, "${Telephony.Sms.DATE} DESC",
+        )
         try {
-            context.contentResolver.query(
-                Telephony.Sms.CONTENT_URI,
-                arrayOf(
-                    Telephony.Sms._ID, Telephony.Sms.THREAD_ID, Telephony.Sms.ADDRESS, Telephony.Sms.BODY,
-                    Telephony.Sms.DATE, Telephony.Sms.TYPE, Telephony.Sms.READ,
-                ),
-                null,
-                null,
-                "${Telephony.Sms.DATE} DESC",
-            )?.use { c ->
+            // Not every OEM provider has the SIM column, so fall back without it.
+            val cursor = runCatching { query(base + Telephony.Sms.SUBSCRIPTION_ID) }.getOrNull() ?: query(base)
+            cursor?.use { c ->
+                val hasSub = c.columnCount > base.size
                 while (c.moveToNext() && list.size < MAX_MESSAGES) {
                     val type = c.getInt(5)
                     if (type == SmsType.DRAFT) continue
@@ -145,6 +150,7 @@ class SmsRepository(
                         date = c.getLong(4),
                         type = type,
                         read = c.getInt(6) != 0,
+                        subId = if (hasSub && !c.isNull(7)) c.getInt(7) else -1,
                     )
                 }
             }
@@ -162,7 +168,8 @@ class SmsRepository(
         if (!hasReadPermission()) return
         val data = store.data.value
         val scam = data.settings.scamProtection
-        val messages = raw.map { r ->
+        val (merged, confirmed) = mergeOutgoing(raw, data.outgoing)
+        val messages = merged.map { r ->
             val sender = SenderAnalyzer.analyze(r.address)
             val override = data.overrides[sender.key]
             val cls = if (r.type != SmsType.INBOX) {
@@ -185,7 +192,7 @@ class SmsRepository(
                 override != null -> override
                 else -> cls.category
             }
-            SmsMessage(r.id, r.threadId, r.address, r.body, r.date, r.type, r.read, sender.key, category, cls)
+            SmsMessage(r.id, r.threadId, r.address, r.body, r.date, r.type, r.read, r.subId, sender.key, category, cls)
         }
 
         val byThread = messages.groupBy { it.threadId }
@@ -234,6 +241,7 @@ class SmsRepository(
                 unreadByCategory = unreadByCategory,
                 threatCount = threatCount,
                 blocked = sender.key in data.blocked,
+                lastIncomingSubId = newestIncoming?.subId ?: -1,
             )
             threads[threadId] = msgs.asReversed()
         }
@@ -255,7 +263,44 @@ class SmsRepository(
             totalUnread = visible.sumOf { it.unread },
             threatsDetected = threats,
         )
+
+        // The system store now has these sent messages; drop our copies.
+        if (confirmed.isNotEmpty()) {
+            store.update { d -> d.copy(outgoing = d.outgoing.filterNot { it.id in confirmed }) }
+        }
     }
+
+    /**
+     * Adds sent messages from BetterSMS's own log that the system SMS store doesn't have
+     * (some phones never save SMS sent by non-default apps). Returns the merged list, newest
+     * first, and the ids of log entries the store has confirmed.
+     */
+    private fun mergeOutgoing(provider: List<RawSms>, records: List<OutgoingRecord>): Pair<List<RawSms>, Set<Long>> {
+        if (records.isEmpty()) return provider to emptySet()
+        val sentByBody = provider.filter { it.type != SmsType.INBOX }.groupBy { it.body.trim() }
+        val threadByKey = HashMap<String, Long>()
+        provider.forEach { threadByKey.putIfAbsent(SenderAnalyzer.keyOf(it.address), it.threadId) }
+        val used = HashSet<Long>()
+        val confirmed = HashSet<Long>()
+        val extra = ArrayList<RawSms>()
+        for (rec in records) {
+            val key = SenderAnalyzer.keyOf(rec.address)
+            val match = sentByBody[rec.body.trim()]
+                ?.filter { it.id !in used && abs(it.date - rec.date) < MATCH_WINDOW_MS && SenderAnalyzer.keyOf(it.address) == key }
+                ?.minByOrNull { abs(it.date - rec.date) }
+            if (match != null) {
+                used += match.id
+                confirmed += rec.id
+                continue
+            }
+            val thread = threadByKey[key] ?: localThreadId(key)
+            extra += RawSms(rec.id, thread, rec.address, rec.body, rec.date, rec.status, true, rec.subId)
+        }
+        if (extra.isEmpty()) return provider to confirmed
+        return (provider + extra).sortedByDescending { it.date } to confirmed
+    }
+
+    private fun localThreadId(key: String): Long = -(abs(key.hashCode().toLong()) + 10)
 
     /** Test hook: render the inbox from in-memory messages instead of the system provider. */
     @VisibleForTesting
@@ -292,7 +337,7 @@ class SmsRepository(
         val now = System.currentTimeMillis()
         store.update { d ->
             val marks = d.readMarks.toMutableMap()
-            if (threadId >= 0) marks["t:$threadId"] = now
+            if (threadId != NO_THREAD) marks["t:$threadId"] = now
             if (senderKey != null) marks[senderKey] = now
             // Keep the map bounded.
             val trimmed = if (marks.size > 600) marks.entries.sortedByDescending { it.value }.take(500).associate { it.toPair() } else marks
@@ -320,18 +365,85 @@ class SmsRepository(
         }
     }
 
-    suspend fun deleteThread(threadId: Long): Boolean = withContext(Dispatchers.IO) {
-        if (!SmsRole.isDefault(context)) return@withContext false
-        SmsProvider.deleteThread(context, threadId).also { requestRefresh() }
+    suspend fun deleteThread(threadId: Long, senderKey: String): Boolean = withContext(Dispatchers.IO) {
+        val ok = when {
+            threadId < 0 -> true // exists only in our sent log
+            SmsRole.isDefault(context) -> SmsProvider.deleteThread(context, threadId)
+            else -> false
+        }
+        if (ok) {
+            store.update { d -> d.copy(outgoing = d.outgoing.filterNot { SenderAnalyzer.keyOf(it.address) == senderKey }) }
+            requestRefresh()
+        }
+        ok
     }
 
     suspend fun deleteMessage(id: Long): Boolean = withContext(Dispatchers.IO) {
+        if (id < 0) {
+            store.update { d -> d.copy(outgoing = d.outgoing.filterNot { it.id == id }) }
+            return@withContext true
+        }
         if (!SmsRole.isDefault(context)) return@withContext false
         (SmsProvider.deleteMessages(context, listOf(id)) > 0).also { requestRefresh() }
     }
 
-    suspend fun send(address: String, body: String): Boolean = withContext(Dispatchers.IO) {
-        SmsSender.send(context, address, body).also { requestRefresh() }
+    /**
+     * Sends an SMS on SIM [subId] (negative = phone default). The message shows up in the chat
+     * immediately and stays there even if the system SMS store never records it.
+     */
+    suspend fun send(address: String, body: String, subId: Int): Boolean = withContext(Dispatchers.IO) {
+        val now = System.currentTimeMillis()
+        val id = -(now * 10 + localSeq.getAndIncrement() % 10)
+        val record = OutgoingRecord(id, address.trim(), body, now, subId, SmsType.OUTBOX)
+        store.update { it.copy(outgoing = (it.outgoing + record).takeLast(MAX_OUTGOING)) }
+        when (val result = SmsSender.send(context, address, body, subId, id, now)) {
+            is SmsSender.Result.Queued -> {
+                requestRefresh()
+                true
+            }
+            is SmsSender.Result.Failed -> {
+                Log.w(TAG, "Send failed: ${result.reason}")
+                setOutgoingStatus(id, SmsType.FAILED)
+                false
+            }
+        }
+    }
+
+    /** Re-sends a failed message and removes the failed copy. */
+    suspend fun retry(message: SmsMessage, subId: Int): Boolean {
+        if (message.isLocal) {
+            store.update { d -> d.copy(outgoing = d.outgoing.filterNot { it.id == message.id }) }
+        } else if (SmsRole.isDefault(context)) {
+            withContext(Dispatchers.IO) { SmsProvider.deleteMessages(context, listOf(message.id)) }
+        }
+        return send(message.address, message.body, subId)
+    }
+
+    /** Delivery callback from the radio for one part of a message. */
+    suspend fun onSendResult(localId: Long, providerUri: Uri?, ok: Boolean, lastPart: Boolean) = withContext(Dispatchers.IO) {
+        if (providerUri != null) {
+            if (!ok) SmsProvider.updateType(context, providerUri, SmsType.FAILED)
+            else if (lastPart) SmsProvider.markSentUnlessFailed(context, providerUri)
+        }
+        val record = store.data.value.outgoing.firstOrNull { it.id == localId }
+        if (record != null) {
+            val status = when {
+                !ok -> SmsType.FAILED
+                lastPart && record.status != SmsType.FAILED -> SmsType.SENT
+                else -> record.status
+            }
+            setOutgoingStatus(localId, status)
+            // We're the default app but couldn't write the row earlier: try once more so other
+            // SMS apps and backups see it too.
+            if (ok && lastPart && providerUri == null && SmsRole.isDefault(context)) {
+                SmsProvider.insertOutgoing(context, record.address, record.body, record.subId, SmsType.SENT, record.date)
+            }
+        }
+        requestRefresh()
+    }
+
+    private fun setOutgoingStatus(id: Long, status: Int) {
+        store.update { d -> d.copy(outgoing = d.outgoing.map { if (it.id == id) it.copy(status = status) else it }) }
     }
 
     /** Deletes OTP messages older than the configured age. Only possible as the default SMS app. */
@@ -359,5 +471,8 @@ class SmsRepository(
     private companion object {
         const val TAG = "SmsRepository"
         const val MAX_MESSAGES = 6000
+        const val MAX_OUTGOING = 1000
+        /** How far apart our log entry and the system's copy of a sent SMS may be. */
+        const val MATCH_WINDOW_MS = 10 * 60_000L
     }
 }

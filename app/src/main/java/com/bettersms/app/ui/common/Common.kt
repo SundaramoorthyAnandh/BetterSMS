@@ -83,6 +83,7 @@ val SMS_PERMISSIONS: Array<String> = buildList {
     add(Manifest.permission.RECEIVE_SMS)
     add(Manifest.permission.SEND_SMS)
     add(Manifest.permission.READ_CONTACTS)
+    add(Manifest.permission.READ_PHONE_STATE)
     if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
 }.toTypedArray()
 

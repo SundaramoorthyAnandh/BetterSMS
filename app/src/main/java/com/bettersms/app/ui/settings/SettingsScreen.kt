@@ -1,6 +1,9 @@
 package com.bettersms.app.ui.settings
 
+import android.Manifest
 import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -32,6 +35,7 @@ import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.NotificationsOff
 import androidx.compose.material.icons.rounded.Report
 import androidx.compose.material.icons.rounded.Security
+import androidx.compose.material.icons.rounded.SimCard
 import androidx.compose.material.icons.rounded.Sms
 import androidx.compose.material.icons.rounded.Timer
 import androidx.compose.material.icons.rounded.VisibilityOff
@@ -60,6 +64,10 @@ import com.bettersms.app.ui.common.ChoiceDialog
 import com.bettersms.app.ui.common.ConfirmDialog
 import com.bettersms.app.ui.common.findActivity
 import com.bettersms.app.ui.common.rememberIsDefaultSmsApp
+import com.bettersms.app.ui.common.rememberPermissionState
+import com.bettersms.app.sms.SimChoice
+import com.bettersms.app.sms.SimInfo
+import com.bettersms.app.sms.Sims
 import com.bettersms.app.ui.common.rememberRequestDefaultSms
 import com.bettersms.app.ui.glass.GlassCard
 import com.bettersms.app.ui.glass.GlassDivider
@@ -69,7 +77,7 @@ import com.bettersms.app.ui.glass.SectionTitle
 import com.bettersms.app.ui.glass.SettingRow
 import com.bettersms.app.ui.theme.Glass
 
-private enum class Picker { LOCK_TIMEOUT, CLIPBOARD, OTP_DELETE, THEME }
+private enum class Picker { LOCK_TIMEOUT, CLIPBOARD, OTP_DELETE, THEME, SIM }
 
 @Composable
 fun SettingsScreen(onBack: () -> Unit, onSecurity: () -> Unit, onBlocked: () -> Unit) {
@@ -82,6 +90,12 @@ fun SettingsScreen(onBack: () -> Unit, onSecurity: () -> Unit, onBlocked: () -> 
     val requestDefault = rememberRequestDefaultSms { container.repo.start() }
     var picker by remember { mutableStateOf<Picker?>(null) }
     var confirmWipe by remember { mutableStateOf(false) }
+    val multiSimCapable = remember { Sims.isMultiSimCapable(ctx) }
+    val phoneGranted = rememberPermissionState(Manifest.permission.READ_PHONE_STATE)
+    val sims = remember(phoneGranted) { Sims.active(ctx) }
+    val phonePermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) picker = Picker.SIM
+    }
 
     fun update(block: (AppSettings) -> AppSettings) = container.store.updateSettings(block)
 
@@ -195,6 +209,16 @@ fun SettingsScreen(onBack: () -> Unit, onSecurity: () -> Unit, onBlocked: () -> 
                     if (isDefault) "BetterSMS is your SMS app" else "Tap to make BetterSMS your SMS app",
                     onClick = if (isDefault) null else requestDefault,
                 )
+                if (multiSimCapable || sims.size >= 2) {
+                    GlassDivider()
+                    SettingRow(
+                        Icons.Rounded.SimCard, "SIM for sending",
+                        if (!phoneGranted) "Allow phone access to choose between your SIMs" else simLabel(s.sendSim, sims),
+                        onClick = {
+                            if (phoneGranted) picker = Picker.SIM else phonePermission.launch(Manifest.permission.READ_PHONE_STATE)
+                        },
+                    )
+                }
                 GlassDivider()
                 SettingRow(Icons.Rounded.DarkMode, "Theme", themeLabel(s.themeMode), onClick = { picker = Picker.THEME })
                 GlassDivider()
@@ -266,6 +290,15 @@ fun SettingsScreen(onBack: () -> Unit, onSecurity: () -> Unit, onBlocked: () -> 
             onSelect = { v -> update { it.copy(themeMode = v) } },
             onDismiss = { picker = null },
         )
+        Picker.SIM -> ChoiceDialog(
+            "SIM for sending",
+            listOf(Choice(SimChoice.ASK, "Ask every time"), Choice(SimChoice.PHONE_DEFAULT, "Phone's default SIM")) +
+                sims.map { Choice(it.subId, "Always ${it.fullLabel}") },
+            s.sendSim,
+            onSelect = { v -> update { it.copy(sendSim = v) } },
+            onDismiss = { picker = null },
+            footer = "Replies from notifications use the SIM the message arrived on, unless you pick a fixed SIM.",
+        )
         null -> Unit
     }
 
@@ -299,6 +332,12 @@ private fun otpDeleteLabel(h: Int) = when (h) {
     1 -> "After 1 hour"
     24 -> "After 24 hours"
     else -> "After ${h / 24} days"
+}
+
+private fun simLabel(setting: Int, sims: List<SimInfo>) = when (setting) {
+    SimChoice.ASK -> "Ask every time"
+    SimChoice.PHONE_DEFAULT -> "Phone's default SIM"
+    else -> sims.firstOrNull { it.subId == setting }?.let { "Always ${it.fullLabel}" } ?: "Ask every time"
 }
 
 private fun themeLabel(m: Int) = when (m) {
